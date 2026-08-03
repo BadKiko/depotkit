@@ -155,10 +155,17 @@ std::vector<uint8_t> sha1File(const std::string &path)
 
 uint32_t adler32(const uint8_t *data, size_t len)
 {
+    // zlib-style deferred modulo - per-byte %65521 was a real CPU sink on multi-GB depots.
     uint32_t a = 0, b = 0;
-    for (size_t i = 0; i < len; ++i) {
-        a = (a + data[i]) % 65521;
-        b = (b + a) % 65521;
+    while (len > 0) {
+        size_t n = len > 5550 ? 5550 : len;
+        len -= n;
+        do {
+            a += *data++;
+            b += a;
+        } while (--n);
+        a %= 65521u;
+        b %= 65521u;
     }
     return (b << 16) | a;
 }

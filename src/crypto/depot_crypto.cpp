@@ -71,26 +71,36 @@ std::vector<uint8_t> base64Decode(const std::string &in)
 }
 
 #if defined(_WIN32)
+BCRYPT_ALG_HANDLE tlsAesAlg(bool useCbc)
+{
+    // One provider per chain mode per thread - opening AES for every chunk is brutal.
+    thread_local BCRYPT_ALG_HANDLE ecb = nullptr;
+    thread_local BCRYPT_ALG_HANDLE cbc = nullptr;
+    BCRYPT_ALG_HANDLE &slot = useCbc ? cbc : ecb;
+    if (slot)
+        return slot;
+    if (BCryptOpenAlgorithmProvider(&slot, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
+        throw std::runtime_error("BCrypt AES open");
+    const wchar_t *chain = useCbc ? BCRYPT_CHAIN_MODE_CBC : BCRYPT_CHAIN_MODE_ECB;
+    if (BCryptSetProperty(slot, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t *>(chain)),
+                          static_cast<ULONG>((wcslen(chain) + 1) * sizeof(wchar_t)), 0)
+        != 0) {
+        BCryptCloseAlgorithmProvider(slot, 0);
+        slot = nullptr;
+        throw std::runtime_error("BCrypt chain mode");
+    }
+    return slot;
+}
+
 std::vector<uint8_t> bcryptDecrypt(const uint8_t key[32], const uint8_t *iv, bool useCbc,
                                    const uint8_t *data, size_t len, bool pkcs7)
 {
-    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_ALG_HANDLE alg = tlsAesAlg(useCbc);
     BCRYPT_KEY_HANDLE hkey = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
-        throw std::runtime_error("BCrypt AES open");
-    const wchar_t *chain = useCbc ? BCRYPT_CHAIN_MODE_CBC : BCRYPT_CHAIN_MODE_ECB;
-    if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t *>(chain)),
-                          static_cast<ULONG>((wcslen(chain) + 1) * sizeof(wchar_t)), 0)
-        != 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        throw std::runtime_error("BCrypt chain mode");
-    }
     if (BCryptGenerateSymmetricKey(alg, &hkey, nullptr, 0, reinterpret_cast<PUCHAR>(const_cast<uint8_t *>(key)),
                                    32, 0)
-        != 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
+        != 0)
         throw std::runtime_error("BCrypt key");
-    }
     DWORD flags = pkcs7 ? BCRYPT_BLOCK_PADDING : 0;
     ULONG outLen = 0;
     std::vector<uint8_t> ivCopy;
@@ -108,7 +118,6 @@ std::vector<uint8_t> bcryptDecrypt(const uint8_t key[32], const uint8_t *iv, boo
         BCryptDecrypt(hkey, reinterpret_cast<PUCHAR>(const_cast<uint8_t *>(data)), static_cast<ULONG>(len),
                       nullptr, ivPtr, ivLen, out.data(), outLen, &outLen, flags);
     BCryptDestroyKey(hkey);
-    BCryptCloseAlgorithmProvider(alg, 0);
     if (st != 0)
         throw std::runtime_error("BCryptDecrypt failed");
     out.resize(outLen);

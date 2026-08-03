@@ -826,9 +826,11 @@ std::vector<CdnServer> SteamSession::contentServers(uint32_t cellId, uint32_t ma
             else if (s.type == "CDNCache")
                 score += 900;
             if (cellId != 0 && s.cellId == static_cast<int32_t>(cellId))
-                score += 500;
+                score += 800;
             else if (cellId != 0 && s.cellId >= 0)
-                score += std::max(0, 200 - std::abs(s.cellId - static_cast<int32_t>(cellId)));
+                score += std::max(0, 300 - std::abs(s.cellId - static_cast<int32_t>(cellId)));
+            else if (s.cellId < 0)
+                score -= 400; // unknown / global anycast - often slower than local cell
             score -= static_cast<int>(s.weightedLoad * 10.f);
             score -= s.load;
             return score;
@@ -842,8 +844,19 @@ std::vector<CdnServer> SteamSession::contentServers(uint32_t cellId, uint32_t ma
         return a.host < b.host;
     });
 
-    // Keep a tight nearby set - rotating across distant hosts hurts speed.
-    constexpr size_t kKeep = 12;
+    // If we have same-cell hosts, drop everything else - remote SteamCache kills RTT.
+    if (cellId != 0) {
+        std::vector<CdnServer> sameCell;
+        for (const auto &s : out) {
+            if (s.cellId == static_cast<int32_t>(cellId))
+                sameCell.push_back(s);
+        }
+        if (!sameCell.empty())
+            out.swap(sameCell);
+    }
+
+    // Tight nearby set - engine pins workers to the top few.
+    constexpr size_t kKeep = 6;
     if (out.size() > kKeep)
         out.resize(kKeep);
     return out;
