@@ -42,9 +42,6 @@ depotkeys.txt
 *.manifest
 *.log
 
-# Reference dumps from SteamKit / SteamRE (local study only)
-docs/ref/
-
 # Compiler junk
 *.o
 *.obj

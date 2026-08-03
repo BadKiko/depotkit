@@ -89,7 +89,6 @@ src/                   library (manifest, crypto, http, steam session, engine)
 tools/depotkit_cli.cpp CLI
 tests/                 ctest
 third_party/lzma/      vendored LZMA decoder
-protos/                reference .proto notes
 ```
 
 ## License
