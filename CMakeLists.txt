@@ -68,6 +68,8 @@ if(DEPOTKIT_BUILD_SHARED)
 else()
   add_library(depotkit STATIC ${DEPOTKIT_SOURCES})
 endif()
+# Static depotkit is linked into steamidra's shared plugin (.so) - needs PIC on Linux.
+set_property(TARGET depotkit PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(depotkit
   PUBLIC
