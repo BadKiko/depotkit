@@ -105,6 +105,11 @@ DEPOTKIT_API depotkit_result depotkit_inspect_manifest(const char *manifest_path
                                                        uint32_t *out_depot_id,
                                                        uint64_t *out_manifest_id);
 
+/** Platform bits from decrypted filenames: 1=windows, 2=linux, 4=macos (OR-able). */
+DEPOTKIT_API depotkit_result depotkit_manifest_platform_hint(const char *manifest_path,
+                                                             const char *key_hex,
+                                                             uint32_t *out_flags);
+
 #ifdef __cplusplus
 }
 #endif

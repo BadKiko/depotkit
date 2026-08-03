@@ -148,6 +148,13 @@ int main(int argc, char **argv)
         std::printf("depot=%u manifest=%llu files=%llu bytes=%llu (%.2f GiB)\n", depot,
                     static_cast<unsigned long long>(mid), static_cast<unsigned long long>(files),
                     static_cast<unsigned long long>(bytes), bytes / (1024.0 * 1024.0 * 1024.0));
+        if (key) {
+            uint32_t flags = 0;
+            if (depotkit_manifest_platform_hint(manifest, key, &flags) == DEPOTKIT_OK) {
+                std::printf("platform_hint flags=%u win=%d linux=%d mac=%d\n", flags, !!(flags & 1),
+                            !!(flags & 2), !!(flags & 4));
+            }
+        }
         return 0;
     }
 

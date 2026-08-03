@@ -173,4 +173,55 @@ depotkit_result depotkit_inspect_manifest(const char *manifest_path, const char 
     }
 }
 
+depotkit_result depotkit_manifest_platform_hint(const char *manifest_path, const char *key_hex,
+                                                uint32_t *out_flags)
+{
+    if (!manifest_path || !out_flags)
+        return DEPOTKIT_ERR_INVALID_ARG;
+    *out_flags = 0;
+    try {
+        auto man = depotkit::loadManifestFile(manifest_path);
+        if (key_hex && *key_hex) {
+            auto key = depotkit::fromHex(key_hex);
+            if (key.size() != 32)
+                return DEPOTKIT_ERR_CRYPTO;
+            depotkit::decryptManifestFilenames(man, key.data());
+        }
+        uint32_t win = 0, lin = 0, mac = 0;
+        for (const auto &f : man.files) {
+            if (f.flags & depotkit::kFileFlagDirectory)
+                continue;
+            std::string name = f.filename;
+            for (char &c : name) {
+                if (c >= 'A' && c <= 'Z')
+                    c = static_cast<char>(c - 'A' + 'a');
+                if (c == '\\')
+                    c = '/';
+            }
+            auto has = [&](const char *s) { return name.find(s) != std::string::npos; };
+            auto ends = [&](const char *s) {
+                const size_t n = std::strlen(s);
+                return name.size() >= n && name.compare(name.size() - n, n, s) == 0;
+            };
+            if (ends(".exe") || ends(".dll") || ends(".pdb") || has("/win64/") || has("/windows/")
+                || has(".exe"))
+                ++win;
+            if (ends(".so") || has(".so.") || has("/linux/") || ends(".sh"))
+                ++lin;
+            if (has(".app/") || ends(".dylib") || has("/macos/") || has("/osx/")
+                || has("contents/macos"))
+                ++mac;
+        }
+        if (win)
+            *out_flags |= 1u;
+        if (lin)
+            *out_flags |= 2u;
+        if (mac)
+            *out_flags |= 4u;
+        return DEPOTKIT_OK;
+    } catch (...) {
+        return DEPOTKIT_ERR_MANIFEST;
+    }
+}
+
 } // extern "C"
