@@ -33,6 +33,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rsa.h>
+#include <openssl/x509.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
