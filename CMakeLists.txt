@@ -81,12 +81,13 @@ target_compile_definitions(depotkit PRIVATE DEPOTKIT_HAVE_ZLIB DEPOTKIT_HAVE_ZST
 target_include_directories(depotkit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lzma)
 target_link_libraries(depotkit PRIVATE ${DEPOTKIT_ZLIB_TARGET} ${DEPOTKIT_ZSTD_TARGET})
 
+# System HTTP/crypto must be PUBLIC so static consumers pick them up.
 if(WIN32)
-  target_link_libraries(depotkit PRIVATE winhttp bcrypt crypt32 ws2_32)
+  target_link_libraries(depotkit PUBLIC winhttp bcrypt crypt32 ws2_32)
 else()
   find_package(CURL REQUIRED)
   find_package(OpenSSL REQUIRED)
-  target_link_libraries(depotkit PRIVATE CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
+  target_link_libraries(depotkit PUBLIC CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 add_executable(depotkit-cli tools/depotkit_cli.cpp)
