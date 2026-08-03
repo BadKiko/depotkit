@@ -32,9 +32,9 @@
 #include <netdb.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
-#include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -281,6 +281,103 @@ std::vector<uint8_t> aesDecryptCbc(const uint8_t key[32], uint8_t iv[16], const 
     out.resize(outLen);
     return out;
 }
+#else
+std::vector<uint8_t> rsaOaepSha1Encrypt(const uint8_t *pubDer, size_t pubLen, const uint8_t *plain,
+                                        size_t plainLen)
+{
+    const unsigned char *p = pubDer;
+    EVP_PKEY *pkey = d2i_PUBKEY(nullptr, &p, static_cast<long>(pubLen));
+    if (!pkey)
+        throw std::runtime_error("d2i_PUBKEY failed");
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("EVP_PKEY_CTX_new");
+    }
+    if (EVP_PKEY_encrypt_init(ctx) <= 0
+        || EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0
+        || EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha1()) <= 0
+        || EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha1()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("RSA OAEP init failed");
+    }
+    size_t outLen = 0;
+    if (EVP_PKEY_encrypt(ctx, nullptr, &outLen, plain, plainLen) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("RSA OAEP size failed");
+    }
+    std::vector<uint8_t> out(outLen);
+    if (EVP_PKEY_encrypt(ctx, out.data(), &outLen, plain, plainLen) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw std::runtime_error("RSA OAEP encrypt failed");
+    }
+    out.resize(outLen);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return out;
+}
+
+std::vector<uint8_t> hmacSha1(const uint8_t *key, size_t keyLen, const uint8_t *data, size_t dataLen)
+{
+    std::vector<uint8_t> out(EVP_MAX_MD_SIZE);
+    unsigned int outLen = 0;
+    if (!HMAC(EVP_sha1(), key, static_cast<int>(keyLen), data, dataLen, out.data(), &outLen) || outLen != 20)
+        throw std::runtime_error("HMAC-SHA1 failed");
+    out.resize(outLen);
+    return out;
+}
+
+std::vector<uint8_t> opensslAes(bool encrypt, bool useCbc, bool pkcs7, const uint8_t key[32],
+                                const uint8_t *iv, const uint8_t *data, size_t len)
+{
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        throw std::runtime_error("EVP_CIPHER_CTX_new");
+    const EVP_CIPHER *cipher = useCbc ? EVP_aes_256_cbc() : EVP_aes_256_ecb();
+    const int okInit = encrypt ? EVP_EncryptInit_ex(ctx, cipher, nullptr, key, useCbc ? iv : nullptr)
+                               : EVP_DecryptInit_ex(ctx, cipher, nullptr, key, useCbc ? iv : nullptr);
+    if (okInit != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP AES init failed");
+    }
+    EVP_CIPHER_CTX_set_padding(ctx, pkcs7 ? 1 : 0);
+    std::vector<uint8_t> out(len + 32);
+    int out1 = 0, out2 = 0;
+    const int okUpd =
+        encrypt ? EVP_EncryptUpdate(ctx, out.data(), &out1, data, static_cast<int>(len))
+                : EVP_DecryptUpdate(ctx, out.data(), &out1, data, static_cast<int>(len));
+    const int okFin =
+        encrypt ? EVP_EncryptFinal_ex(ctx, out.data() + out1, &out2)
+                : EVP_DecryptFinal_ex(ctx, out.data() + out1, &out2);
+    EVP_CIPHER_CTX_free(ctx);
+    if (okUpd != 1 || okFin != 1)
+        throw std::runtime_error("EVP AES crypt failed");
+    out.resize(static_cast<size_t>(out1 + out2));
+    return out;
+}
+
+std::vector<uint8_t> aesEncryptEcb(const uint8_t key[32], const uint8_t block[16])
+{
+    return opensslAes(true, false, false, key, nullptr, block, 16);
+}
+
+std::vector<uint8_t> aesEncryptCbc(const uint8_t key[32], uint8_t iv[16], const uint8_t *data, size_t len)
+{
+    return opensslAes(true, true, true, key, iv, data, len);
+}
+
+std::vector<uint8_t> aesDecryptEcb(const uint8_t key[32], const uint8_t block[16])
+{
+    return opensslAes(false, false, false, key, nullptr, block, 16);
+}
+
+std::vector<uint8_t> aesDecryptCbc(const uint8_t key[32], uint8_t iv[16], const uint8_t *data, size_t len)
+{
+    return opensslAes(false, true, true, key, iv, data, len);
+}
 #endif
 
 std::vector<uint8_t> netfilterEncrypt(const uint8_t sessionKey[32], const uint8_t *plain, size_t len)
@@ -294,17 +391,10 @@ std::vector<uint8_t> netfilterEncrypt(const uint8_t sessionKey[32], const uint8_
     hmacBuf.insert(hmacBuf.end(), plain, plain + len);
     auto mac = hmacSha1(sessionKey, 16, hmacBuf.data(), hmacBuf.size());
     std::memcpy(iv, mac.data(), 13);
-#if defined(_WIN32)
     auto encIv = aesEncryptEcb(sessionKey, iv);
     uint8_t ivCopy[16];
     std::memcpy(ivCopy, iv, 16);
     auto encBody = aesEncryptCbc(sessionKey, ivCopy, plain, len);
-#else
-    (void)sessionKey;
-    (void)plain;
-    (void)len;
-    throw std::runtime_error("netfilter encrypt needs Win BCrypt path or OpenSSL port");
-#endif
     std::vector<uint8_t> out = encIv;
     out.insert(out.end(), encBody.begin(), encBody.end());
     return out;
@@ -314,17 +404,10 @@ std::vector<uint8_t> netfilterDecrypt(const uint8_t sessionKey[32], const uint8_
 {
     if (len < 16)
         throw std::runtime_error("packet too short");
-#if defined(_WIN32)
     auto iv = aesDecryptEcb(sessionKey, data);
     uint8_t ivCopy[16];
     std::memcpy(ivCopy, iv.data(), 16);
     return aesDecryptCbc(sessionKey, ivCopy, data + 16, len - 16);
-#else
-    (void)sessionKey;
-    (void)data;
-    (void)len;
-    throw std::runtime_error("netfilter decrypt needs Win BCrypt path or OpenSSL port");
-#endif
 }
 
 std::vector<uint8_t> buildMsgHdr(uint32_t emsg, uint64_t sourceJob = 0xFFFFFFFFFFFFFFFFULL,
@@ -432,13 +515,13 @@ std::string SteamSession::pickCmEndpoint()
 
 void SteamSession::tcpConnect(const std::string &host, int port)
 {
-#if defined(_WIN32)
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo *res = nullptr;
     if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0)
         throw std::runtime_error("getaddrinfo CM failed");
+#if defined(_WIN32)
     SOCKET s = INVALID_SOCKET;
     for (auto *p = res; p; p = p->ai_next) {
         s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -457,9 +540,25 @@ void SteamSession::tcpConnect(const std::string &host, int port)
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout), sizeof(timeout));
     sock_ = static_cast<uintptr_t>(s);
 #else
-    (void)host;
-    (void)port;
-    throw std::runtime_error("CM TCP not ported to non-Windows yet");
+    int s = -1;
+    for (auto *p = res; p; p = p->ai_next) {
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (s < 0)
+            continue;
+        if (::connect(s, p->ai_addr, p->ai_addrlen) == 0)
+            break;
+        close(s);
+        s = -1;
+    }
+    freeaddrinfo(res);
+    if (s < 0)
+        throw std::runtime_error("connect CM failed");
+    timeval timeout{};
+    timeout.tv_sec = 15;
+    timeout.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    sock_ = s;
 #endif
 }
 
@@ -469,33 +568,47 @@ bool SteamSession::recvPacket(std::vector<uint8_t> &out, int timeoutMs)
     SOCKET s = static_cast<SOCKET>(sock_);
     DWORD t = static_cast<DWORD>(timeoutMs);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&t), sizeof(t));
+    auto recvn = [&](char *buf, int n) -> bool {
+        int got = 0;
+        while (got < n) {
+            const int r = recv(s, buf + got, n - got, 0);
+            if (r <= 0)
+                return false;
+            got += r;
+        }
+        return true;
+    };
+#else
+    if (sock_ < 0)
+        return false;
+    const int s = sock_;
+    timeval t{};
+    t.tv_sec = timeoutMs / 1000;
+    t.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(t));
+    auto recvn = [&](char *buf, int n) -> bool {
+        int got = 0;
+        while (got < n) {
+            const ssize_t r = ::recv(s, buf + got, static_cast<size_t>(n - got), 0);
+            if (r <= 0)
+                return false;
+            got += static_cast<int>(r);
+        }
+        return true;
+    };
+#endif
     uint8_t lenBuf[4];
-    int got = 0;
-    while (got < 4) {
-        const int n = recv(s, reinterpret_cast<char *>(lenBuf + got), 4 - got, 0);
-        if (n <= 0)
-            return false;
-        got += n;
-    }
+    if (!recvn(reinterpret_cast<char *>(lenBuf), 4))
+        return false;
     const uint32_t len = readU32(lenBuf);
     if (len == 0 || len > 8 * 1024 * 1024)
         return false;
     out.resize(len);
-    got = 0;
-    while (got < static_cast<int>(len)) {
-        const int n = recv(s, reinterpret_cast<char *>(out.data() + got), static_cast<int>(len) - got, 0);
-        if (n <= 0)
-            return false;
-        got += n;
-    }
+    if (!recvn(reinterpret_cast<char *>(out.data()), static_cast<int>(len)))
+        return false;
     if (encrypted_)
         out = netfilterDecrypt(sessionKey_.data(), out.data(), out.size());
     return true;
-#else
-    (void)out;
-    (void)timeoutMs;
-    return false;
-#endif
 }
 
 void SteamSession::sendRaw(const uint8_t *data, size_t len, bool encrypt)
@@ -517,8 +630,15 @@ void SteamSession::sendRaw(const uint8_t *data, size_t len, bool encrypt)
         off += static_cast<size_t>(n);
     }
 #else
-    (void)encrypt;
-    throw std::runtime_error("CM send not ported");
+    if (sock_ < 0)
+        throw std::runtime_error("CM send failed");
+    size_t off = 0;
+    while (off < packet.size()) {
+        const ssize_t n = ::send(sock_, packet.data() + off, packet.size() - off, 0);
+        if (n <= 0)
+            throw std::runtime_error("CM send failed");
+        off += static_cast<size_t>(n);
+    }
 #endif
 }
 
@@ -545,11 +665,7 @@ void SteamSession::performChannelEncrypt()
 
     std::vector<uint8_t> blob = sessionKey_;
     blob.insert(blob.end(), challenge.begin(), challenge.end());
-#if defined(_WIN32)
     auto enc = rsaOaepSha1Encrypt(kSteamPublicKey, sizeof(kSteamPublicKey), blob.data(), blob.size());
-#else
-    throw std::runtime_error("RSA encrypt not ported");
-#endif
     auto crc = crc32(enc.data(), enc.size());
 
     auto resp = buildMsgHdr(kEMsgChannelEncryptResponse);
