@@ -1,0 +1,58 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+out/
+dist/
+_deps/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+Makefile
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+Thumbs.db
+.DS_Store
+*~
+
+# Local staging / downloads / keys (don't push game dumps)
+*-staging/
+*-out/
+*-out-*/
+sw-staging/
+hj-staging/
+hj-out/
+hj-out-*/
+sw-cell-test/
+depotkeys.txt
+*.manifest
+*.log
+
+# Reference dumps from SteamKit / SteamRE (local study only)
+docs/ref/
+
+# Compiler junk
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+!third_party/**/*.c
+!third_party/**/*.h

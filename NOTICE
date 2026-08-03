@@ -1,0 +1,8 @@
+depotkit
+=======
+
+Protocol field layouts and on-wire formats were studied from public SteamRE/SteamKit
+documentation and source (LGPL-2.1). This project is an independent clean-room
+implementation and does not include SteamKit or DepotDownloader source code.
+
+Steam, Steamworks, and related marks are trademarks of Valve Corporation.
