@@ -69,8 +69,10 @@ bool fileLooksComplete(const std::string &path, uint64_t size, const std::vector
         return false;
     if (fs::file_size(path, ec) != size || ec)
         return false;
+    // Size-only skip is wrong: we SetEndOfFile/preallocate before chunks land, so a
+    // killed download leaves full-sized stubs that would look "done" and skip forever.
     if (!validate)
-        return true;
+        return false;
     try {
         return sha1File(path) == hash;
     } catch (...) {

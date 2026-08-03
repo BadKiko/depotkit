@@ -68,7 +68,7 @@ typedef struct depotkit_request {
     size_t depot_count;
     const char *install_dir;
     uint32_t max_downloads; /* 0 = default 32; raise for fat pipes */
-    int validate;           /* re-check existing files */
+    int validate;           /* 1 = SHA1-skip complete files; 0 = never skip (size skip is unsafe with prealloc) */
     uint32_t cell_id;       /* 0 = default */
 } depotkit_request;
 
