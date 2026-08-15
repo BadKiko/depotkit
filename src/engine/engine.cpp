@@ -341,13 +341,28 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
 
     std::vector<WorkItem> workFlat;
     uint64_t totalBytes = 0;
+    uint64_t seenBytes = 0;
+    uint64_t completeBytes = 0;
     uint32_t totalFiles = 0;
     uint32_t filesDone = 0;
+    uint32_t depotsLoaded = 0;
 
     for (size_t di = 0; di < req->depot_count; ++di) {
+        if (ctrl && ctrl->cancelled.load())
+            return DEPOTKIT_ERR_CANCELLED;
         const auto &d = req->depots[di];
         if (!d.manifest_path || !d.key_hex)
             return DEPOTKIT_ERR_INVALID_ARG;
+        {
+            const std::string detail = "Planning depot " + std::to_string(di + 1) + "/"
+                                       + std::to_string(req->depot_count)
+                                       + " (" + std::to_string(d.depot_id) + ")…";
+            emit(onProgress, user,
+                 depotkit_progress{completeBytes, std::max(seenBytes, totalBytes), 0, filesDone,
+                                   totalFiles, static_cast<uint32_t>(di),
+                                   static_cast<uint32_t>(req->depot_count), DEPOTKIT_PHASE_PLANNING,
+                                   detail.c_str()});
+        }
         Manifest man;
         try {
             man = loadManifestFile(d.manifest_path);
@@ -355,10 +370,15 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
             if (key.size() != 32)
                 return DEPOTKIT_ERR_CRYPTO;
             decryptManifestFilenames(man, key.data());
+            auto lastHashEmit = std::chrono::steady_clock::now();
+            uint32_t hashedSinceEmit = 0;
             for (const auto &f : man.files) {
+                if (ctrl && ctrl->cancelled.load())
+                    return DEPOTKIT_ERR_CANCELLED;
                 if (f.flags & kFileFlagDirectory)
                     continue;
                 ++totalFiles;
+                seenBytes += f.size;
                 std::string path = std::string(req->install_dir);
 #if defined(_WIN32)
                 if (!path.empty() && path.back() != '\\' && path.back() != '/')
@@ -370,6 +390,22 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
                 path += f.filename;
                 if (fileLooksComplete(path, f.size, f.contentHash, req->validate != 0)) {
                     ++filesDone;
+                    completeBytes += f.size;
+                    ++hashedSinceEmit;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (hashedSinceEmit >= 4
+                        || std::chrono::duration<double>(now - lastHashEmit).count() >= 0.35) {
+                        const std::string detail =
+                            "Checking existing files… " + std::to_string(filesDone) + "/"
+                            + std::to_string(totalFiles);
+                        emit(onProgress, user,
+                             depotkit_progress{completeBytes, seenBytes, 0, filesDone, totalFiles,
+                                               static_cast<uint32_t>(di),
+                                               static_cast<uint32_t>(req->depot_count),
+                                               DEPOTKIT_PHASE_PLANNING, detail.c_str()});
+                        lastHashEmit = now;
+                        hashedSinceEmit = 0;
+                    }
                     continue;
                 }
                 for (const auto &ch : f.chunks) {
@@ -385,12 +421,24 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
                     workFlat.push_back(std::move(w));
                 }
             }
+            ++depotsLoaded;
         } catch (const std::exception &ex) {
+            // One bad DLC/staging manifest should not kill the whole install.
+            const std::string detail =
+                std::string("Skipping depot ") + std::to_string(d.depot_id) + ": " + ex.what();
             emit(onProgress, user,
-                 depotkit_progress{0, 0, 0, 0, 0, 0, static_cast<uint32_t>(req->depot_count),
-                                   DEPOTKIT_PHASE_ERROR, ex.what()});
-            return DEPOTKIT_ERR_MANIFEST;
+                 depotkit_progress{completeBytes, seenBytes, 0, filesDone, totalFiles,
+                                   static_cast<uint32_t>(di),
+                                   static_cast<uint32_t>(req->depot_count), DEPOTKIT_PHASE_PLANNING,
+                                   detail.c_str()});
+            continue;
         }
+    }
+    if (depotsLoaded == 0) {
+        emit(onProgress, user,
+             depotkit_progress{0, 0, 0, 0, 0, 0, static_cast<uint32_t>(req->depot_count),
+                               DEPOTKIT_PHASE_ERROR, "No readable manifests"});
+        return DEPOTKIT_ERR_MANIFEST;
     }
 
     std::atomic<uint64_t> bytesDone{0};
