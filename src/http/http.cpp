@@ -260,9 +260,9 @@ size_t writeCb(char *ptr, size_t size, size_t nmemb, void *userdata)
 
 struct CurlSlot {
     CURL *easy = nullptr;
-    CurlSlot()
+
+    void applyDefaults(long httpVersion)
     {
-        easy = curl_easy_init();
         if (!easy)
             return;
         curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
@@ -271,8 +271,21 @@ struct CurlSlot {
         curl_easy_setopt(easy, CURLOPT_TCP_KEEPIDLE, 30L);
         curl_easy_setopt(easy, CURLOPT_TCP_KEEPINTVL, 15L);
         curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
-        curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, httpVersion);
     }
+
+    void reset(long httpVersion = CURL_HTTP_VERSION_2TLS)
+    {
+        if (easy) {
+            curl_easy_cleanup(easy);
+            easy = nullptr;
+        }
+        easy = curl_easy_init();
+        applyDefaults(httpVersion);
+    }
+
+    CurlSlot() { reset(); }
     ~CurlSlot()
     {
         if (easy)
@@ -282,25 +295,53 @@ struct CurlSlot {
 
 thread_local CurlSlot tCurl;
 
+bool isTransientCurl(CURLcode rc)
+{
+    return rc == CURLE_RECV_ERROR || rc == CURLE_SEND_ERROR || rc == CURLE_OPERATION_TIMEDOUT
+           || rc == CURLE_COULDNT_CONNECT || rc == CURLE_PARTIAL_FILE || rc == CURLE_GOT_NOTHING
+#if defined(CURLE_HTTP2)
+           || rc == CURLE_HTTP2
+#endif
+#if defined(CURLE_HTTP2_STREAM)
+           || rc == CURLE_HTTP2_STREAM
+#endif
+        ;
+}
+
 HttpResponse curlGetReuse(const std::string &url, int timeoutMs)
 {
     HttpResponse resp;
-    CURL *curl = tCurl.easy;
-    if (!curl) {
-        resp.error = "curl_easy_init failed";
-        return resp;
-    }
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeoutMs));
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
-    const CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        resp.error = curl_easy_strerror(rc);
-    } else {
+    auto perform = [&](long httpVersion) -> CURLcode {
+        if (!tCurl.easy)
+            tCurl.reset(httpVersion);
+        else
+            tCurl.applyDefaults(httpVersion);
+
+        resp.body.clear();
+        resp.status = 0;
+        resp.error.clear();
+        char errbuf[CURL_ERROR_SIZE] = {};
+        curl_easy_setopt(tCurl.easy, CURLOPT_ERRORBUFFER, errbuf);
+        curl_easy_setopt(tCurl.easy, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(tCurl.easy, CURLOPT_TIMEOUT_MS, static_cast<long>(timeoutMs));
+        curl_easy_setopt(tCurl.easy, CURLOPT_WRITEFUNCTION, writeCb);
+        curl_easy_setopt(tCurl.easy, CURLOPT_WRITEDATA, &resp.body);
+        const CURLcode rc = curl_easy_perform(tCurl.easy);
+        if (rc != CURLE_OK) {
+            resp.error = errbuf[0] ? errbuf : curl_easy_strerror(rc);
+            return rc;
+        }
         long code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+        curl_easy_getinfo(tCurl.easy, CURLINFO_RESPONSE_CODE, &code);
         resp.status = static_cast<int>(code);
+        return rc;
+    };
+
+    CURLcode rc = perform(CURL_HTTP_VERSION_2TLS);
+    // Sticky HTTP/2 sessions go bad under parallel CDN load - drop and retry on 1.1.
+    if (isTransientCurl(rc) || (rc == CURLE_OK && resp.status == 0)) {
+        tCurl.reset(CURL_HTTP_VERSION_1_1);
+        rc = perform(CURL_HTTP_VERSION_1_1);
     }
     return resp;
 }

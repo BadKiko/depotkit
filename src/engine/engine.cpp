@@ -44,6 +44,7 @@ struct WorkItem {
     std::vector<uint8_t> fileHash;
     ChunkInfo chunk;
     std::vector<uint8_t> key;
+    uint8_t requeues = 0;
 };
 
 struct FileSlot {
@@ -326,7 +327,7 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
     }
 
     // Probe TCP RTT and keep the fastest SteamCache edge (+1 failover).
-    pinFastestServers(servers, 2);
+    pinFastestServers(servers, 4);
     {
         const std::string detail = "CDN pin " + servers.front().host + " cell="
                                    + std::to_string(servers.front().cellId);
@@ -544,7 +545,7 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
 
             bool ok = false;
             std::string lastErr;
-            for (int attempt = 0; attempt < 6 && !ok; ++attempt) {
+            for (int attempt = 0; attempt < 10 && !ok; ++attempt) {
                 if (ctrl && ctrl->cancelled.load())
                     return;
                 if (ctrl && ctrl->paused.load()) {
@@ -554,7 +555,13 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
                         return;
                     maybeEmit(DEPOTKIT_PHASE_DOWNLOADING, "Downloading…", 0);
                 }
+                if (attempt > 0)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40 * attempt));
 
+                if (stickyN == 0) {
+                    lastErr = "no CDN servers";
+                    break;
+                }
                 const size_t srvIndex = (hostCursor + static_cast<size_t>(attempt)) % stickyN;
                 const CdnServer &srv = servers[srvIndex];
                 std::string token;
@@ -621,6 +628,13 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
             }
 
             if (!ok) {
+                // One soft requeue - transient CDN / HTTP2 flakes shouldn't kill the whole job.
+                if (item.requeues < 1 && !failed.load()) {
+                    item.requeues = static_cast<uint8_t>(item.requeues + 1);
+                    std::lock_guard lock(qmu);
+                    queue.push_back(std::move(item));
+                    continue;
+                }
                 std::lock_guard lock(failMu);
                 failed = true;
                 failMsg = "chunk download failed for " + item.path + ": " + lastErr;

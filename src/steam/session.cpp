@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -425,6 +427,26 @@ std::vector<uint8_t> buildMsgHdr(uint32_t emsg, uint64_t sourceJob = 0xFFFFFFFFF
 
 uint32_t detectSteamCellId()
 {
+    auto parseCellFromVdf = [](const std::string &text) -> uint32_t {
+        for (const char *key : {"\"CurrentCellID\"", "\"CellIDServerOverride\"", "\"CellID\""}) {
+            size_t pos = text.find(key);
+            if (pos == std::string::npos)
+                continue;
+            pos = text.find('"', pos + std::strlen(key));
+            if (pos == std::string::npos)
+                continue;
+            const size_t start = pos + 1;
+            const size_t end = text.find('"', start);
+            if (end == std::string::npos || end == start)
+                continue;
+            try {
+                return static_cast<uint32_t>(std::stoul(text.substr(start, end - start)));
+            } catch (...) {
+            }
+        }
+        return 0;
+    };
+
 #if defined(_WIN32)
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, KEY_READ, &key) != ERROR_SUCCESS)
@@ -448,23 +470,30 @@ uint32_t detectSteamCellId()
         cfg.pop_back();
     cfg += "\\config\\config.vdf";
     try {
-        const std::string text = readFileBytesAsString(cfg);
-        const std::string needle = "\"CurrentCellID\"";
-        size_t pos = text.find(needle);
-        if (pos == std::string::npos)
-            return 0;
-        pos = text.find('"', pos + needle.size());
-        if (pos == std::string::npos)
-            return 0;
-        const size_t start = pos + 1;
-        const size_t end = text.find('"', start);
-        if (end == std::string::npos)
-            return 0;
-        return static_cast<uint32_t>(std::stoul(text.substr(start, end - start)));
+        return parseCellFromVdf(readFileBytesAsString(cfg));
     } catch (...) {
         return 0;
     }
 #else
+    const char *home = std::getenv("HOME");
+    if (!home || !*home)
+        return 0;
+    const std::string homeDir(home);
+    const std::vector<std::string> candidates = {
+        homeDir + "/.steam/steam/config/config.vdf",
+        homeDir + "/.steam/debian-installation/config/config.vdf",
+        homeDir + "/.steam/root/config/config.vdf",
+        homeDir + "/.local/share/Steam/config/config.vdf",
+        homeDir + "/.var/app/com.valvesoftware.Steam/.local/share/Steam/config/config.vdf",
+    };
+    for (const auto &cfg : candidates) {
+        try {
+            const uint32_t cell = parseCellFromVdf(readFileBytesAsString(cfg));
+            if (cell != 0)
+                return cell;
+        } catch (...) {
+        }
+    }
     return 0;
 #endif
 }
@@ -934,14 +963,58 @@ std::vector<CdnServer> SteamSession::contentServers(uint32_t cellId, uint32_t ma
     if (out.empty())
         throw std::runtime_error("no CDN servers parsed");
 
+    auto hostKey = [](const CdnServer &s) -> const std::string & {
+        return s.vhost.empty() ? s.host : s.vhost;
+    };
+    // Partner steampipe edges that currently serve the wrong TLS cert (CloudFront etc.).
+    auto tlsBrokenHost = [](const std::string &h) {
+        return h.find("alibaba.cdn.") != std::string::npos
+               || h.find("edgenext.cdn.") != std::string::npos;
+    };
+    auto isSteamCacheHost = [](const CdnServer &s) {
+        const std::string &h = s.vhost.empty() ? s.host : s.vhost;
+        return s.type == "SteamCache" || s.type == "CDNCache"
+               || h.rfind("cache", 0) == 0;
+    };
+
+    {
+        std::vector<CdnServer> filtered;
+        filtered.reserve(out.size());
+        for (auto &s : out) {
+            if (tlsBrokenHost(hostKey(s)))
+                continue;
+            filtered.push_back(std::move(s));
+        }
+        if (!filtered.empty())
+            out.swap(filtered);
+    }
+
+    // cell 0 / some overrides only return *.cdn.steampipe anycast. Pull real SteamCache
+    // edges from a known-good cell so downloads are not stuck on broken TLS hosts.
+    const bool haveSteamCache = std::any_of(out.begin(), out.end(), isSteamCacheHost);
+    if (!haveSteamCache && cellId != 1) {
+        try {
+            auto backup = contentServers(1, maxServers);
+            for (auto &s : backup) {
+                if (!isSteamCacheHost(s) || tlsBrokenHost(hostKey(s)))
+                    continue;
+                out.push_back(std::move(s));
+            }
+        } catch (...) {
+        }
+    }
+
     // Prefer CDN caches near requested cell with lowest weighted load.
     std::sort(out.begin(), out.end(), [&](const CdnServer &a, const CdnServer &b) {
         auto rank = [&](const CdnServer &s) {
             int score = 0;
-            if (s.type == "CDN" || s.type == "SteamCache")
+            if (s.type == "SteamCache")
+                score += 1200;
+            else if (s.type == "CDN" || s.type == "CDNCache")
                 score += 1000;
-            else if (s.type == "CDNCache")
-                score += 900;
+            const std::string &h = hostKey(s);
+            if (h.find(".cdn.steampipe.steamcontent.com") != std::string::npos)
+                score -= 600; // anycast / partner - fine as fallback only
             if (cellId != 0 && s.cellId == static_cast<int32_t>(cellId))
                 score += 800;
             else if (cellId != 0 && s.cellId >= 0)
@@ -968,12 +1041,15 @@ std::vector<CdnServer> SteamSession::contentServers(uint32_t cellId, uint32_t ma
             if (s.cellId == static_cast<int32_t>(cellId))
                 sameCell.push_back(s);
         }
-        if (!sameCell.empty())
+        // Keep mixed list when same-cell is only broken steampipe anycast.
+        const bool sameHasCache =
+            std::any_of(sameCell.begin(), sameCell.end(), isSteamCacheHost);
+        if (!sameCell.empty() && sameHasCache)
             out.swap(sameCell);
     }
 
     // Tight nearby set - engine pins workers to the top few.
-    constexpr size_t kKeep = 6;
+    constexpr size_t kKeep = 8;
     if (out.size() > kKeep)
         out.resize(kKeep);
     return out;
