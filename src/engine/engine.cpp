@@ -347,6 +347,7 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
     uint32_t totalFiles = 0;
     uint32_t filesDone = 0;
     uint32_t depotsLoaded = 0;
+    std::vector<std::string> skipReasons;
 
     for (size_t di = 0; di < req->depot_count; ++di) {
         if (ctrl && ctrl->cancelled.load())
@@ -427,6 +428,8 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
             // One bad DLC/staging manifest should not kill the whole install.
             const std::string detail =
                 std::string("Skipping depot ") + std::to_string(d.depot_id) + ": " + ex.what();
+            if (skipReasons.size() < 3)
+                skipReasons.push_back(detail);
             emit(onProgress, user,
                  depotkit_progress{completeBytes, seenBytes, 0, filesDone, totalFiles,
                                    static_cast<uint32_t>(di),
@@ -436,9 +439,19 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
         }
     }
     if (depotsLoaded == 0) {
+        std::string err = "No readable manifests";
+        if (!skipReasons.empty()) {
+            err.push_back(':');
+            for (size_t i = 0; i < skipReasons.size(); ++i) {
+                err.push_back(' ');
+                err += skipReasons[i];
+                if (i + 1 < skipReasons.size())
+                    err.push_back(';');
+            }
+        }
         emit(onProgress, user,
              depotkit_progress{0, 0, 0, 0, 0, 0, static_cast<uint32_t>(req->depot_count),
-                               DEPOTKIT_PHASE_ERROR, "No readable manifests"});
+                               DEPOTKIT_PHASE_ERROR, err.c_str()});
         return DEPOTKIT_ERR_MANIFEST;
     }
 
