@@ -103,7 +103,11 @@ std::vector<uint8_t> sha1(const uint8_t *data, size_t len)
 
 std::vector<uint8_t> sha1File(const std::string &path)
 {
+#if defined(_WIN32)
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+#else
     std::ifstream in(path, std::ios::binary);
+#endif
     if (!in)
         throw std::runtime_error("open failed: " + path);
     std::vector<uint8_t> buf(1 << 20);
@@ -185,7 +189,12 @@ uint32_t crc32(const uint8_t *data, size_t len)
 
 std::vector<uint8_t> readFile(const std::string &path)
 {
+#if defined(_WIN32)
+    // Paths from Qt are UTF-8; MSVC ifstream(string) uses the ANSI code page.
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+#else
     std::ifstream in(path, std::ios::binary);
+#endif
     if (!in)
         throw std::runtime_error("open failed: " + path);
     in.seekg(0, std::ios::end);
