@@ -102,7 +102,9 @@ std::vector<uint8_t> bcryptDecrypt(const uint8_t key[32], const uint8_t *iv, boo
         != 0)
         throw std::runtime_error("BCrypt key");
     DWORD flags = pkcs7 ? BCRYPT_BLOCK_PADDING : 0;
-    ULONG outLen = 0;
+    // AES output is never larger than the ciphertext (PKCS7 only shrinks). Decrypt in
+    // one shot: a prior size-query BCryptDecrypt mutates the CBC IV in place, so the
+    // real call then fails (Windows "No readable manifests" on encrypted filenames).
     std::vector<uint8_t> ivCopy;
     PUCHAR ivPtr = nullptr;
     ULONG ivLen = 0;
@@ -111,9 +113,8 @@ std::vector<uint8_t> bcryptDecrypt(const uint8_t key[32], const uint8_t *iv, boo
         ivPtr = ivCopy.data();
         ivLen = 16;
     }
-    BCryptDecrypt(hkey, reinterpret_cast<PUCHAR>(const_cast<uint8_t *>(data)), static_cast<ULONG>(len),
-                  nullptr, ivPtr, ivLen, nullptr, 0, &outLen, flags);
-    std::vector<uint8_t> out(outLen);
+    std::vector<uint8_t> out(len);
+    ULONG outLen = static_cast<ULONG>(len);
     const NTSTATUS st =
         BCryptDecrypt(hkey, reinterpret_cast<PUCHAR>(const_cast<uint8_t *>(data)), static_cast<ULONG>(len),
                       nullptr, ivPtr, ivLen, out.data(), outLen, &outLen, flags);
