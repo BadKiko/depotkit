@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "file_slot.hpp"
 
 #include "../crypto/depot_crypto.hpp"
 #include "../http/http.hpp"
@@ -12,7 +13,6 @@
 #include <climits>
 #include <deque>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -45,15 +45,6 @@ struct WorkItem {
     ChunkInfo chunk;
     std::vector<uint8_t> key;
     uint8_t requeues = 0;
-};
-
-struct FileSlot {
-    std::mutex mu;
-    std::fstream stream;
-#if defined(_WIN32)
-    HANDLE handle = INVALID_HANDLE_VALUE;
-#endif
-    std::atomic<bool> ready{false};
 };
 
 void emit(depotkit_progress_fn cb, void *user, depotkit_progress p)
@@ -171,88 +162,6 @@ void pinFastestServers(std::vector<CdnServer> &servers, size_t keep)
     servers.clear();
     for (size_t i = 0; i < scored.size() && servers.size() < keep; ++i)
         servers.push_back(std::move(scored[i].srv));
-}
-
-bool openFileSlot(FileSlot &slot, const std::string &path, uint64_t fileSize, std::string &err)
-{
-    if (slot.ready.load())
-        return true;
-    ensureParentDir(path);
-#if defined(_WIN32)
-    const std::wstring wpath = std::filesystem::path(path).wstring();
-    slot.handle = CreateFileW(wpath.c_str(), GENERIC_READ | GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (slot.handle == INVALID_HANDLE_VALUE) {
-        err = "CreateFile failed for " + path;
-        return false;
-    }
-    LARGE_INTEGER size{};
-    size.QuadPart = static_cast<LONGLONG>(fileSize);
-    if (fileSize > 0) {
-        LARGE_INTEGER cur{};
-        if (SetFilePointerEx(slot.handle, size, &cur, FILE_BEGIN) && SetEndOfFile(slot.handle)) {
-            // pre-sized
-        }
-    }
-#else
-    slot.stream.open(path, std::ios::in | std::ios::out | std::ios::binary);
-    if (!slot.stream) {
-        std::ofstream create(path, std::ios::binary | std::ios::trunc);
-        create.close();
-        slot.stream.open(path, std::ios::in | std::ios::out | std::ios::binary);
-    }
-    if (!slot.stream) {
-        err = "cannot open " + path;
-        return false;
-    }
-    if (fileSize > 0) {
-        slot.stream.seekp(static_cast<std::streamoff>(fileSize > 0 ? fileSize - 1 : 0));
-        char zero = 0;
-        slot.stream.write(&zero, 1);
-        slot.stream.flush();
-    }
-#endif
-    slot.ready.store(true);
-    return true;
-}
-
-void closeFileSlot(FileSlot &slot)
-{
-#if defined(_WIN32)
-    if (slot.handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(slot.handle);
-        slot.handle = INVALID_HANDLE_VALUE;
-    }
-#else
-    if (slot.stream.is_open())
-        slot.stream.close();
-#endif
-    slot.ready.store(false);
-}
-
-bool writeFileSlot(FileSlot &slot, uint64_t offset, const uint8_t *data, size_t n, std::string &err)
-{
-#if defined(_WIN32)
-    OVERLAPPED ov{};
-    ov.Offset = static_cast<DWORD>(offset & 0xffffffffu);
-    ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
-    DWORD written = 0;
-    // Sync handle + OVERLAPPED offset = concurrent writes to different ranges are OK.
-    if (!WriteFile(slot.handle, data, static_cast<DWORD>(n), &written, &ov) || written != n) {
-        err = "write failed";
-        return false;
-    }
-#else
-    std::lock_guard lock(slot.mu);
-    slot.stream.seekp(static_cast<std::streamoff>(offset));
-    slot.stream.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(n));
-    if (!slot.stream) {
-        err = "write failed";
-        return false;
-    }
-#endif
-    return true;
 }
 
 /** Spread chunks across files so many paths stay hot in parallel. */
@@ -557,6 +466,7 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
             }
 
             bool ok = false;
+            bool ioFailure = false;
             std::string lastErr;
             for (int attempt = 0; attempt < 10 && !ok; ++attempt) {
                 if (ctrl && ctrl->cancelled.load())
@@ -616,18 +526,11 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
 
                     FileSlot &slot = slotFor(item.path);
                     std::string ioErr;
-                    {
-                        if (!slot.ready.load()) {
-                            std::lock_guard lock(slot.mu);
-                            if (!openFileSlot(slot, item.path, item.fileSize, ioErr)) {
-                                lastErr = ioErr;
-                                continue;
-                            }
-                        }
-                        if (!writeFileSlot(slot, item.chunk.offset, outBuf.data(), n, ioErr)) {
-                            lastErr = ioErr;
-                            continue;
-                        }
+                    if (!slot.write(item.path, item.fileSize, item.chunk.offset,
+                                    outBuf.data(), n, ioErr)) {
+                        lastErr = ioErr;
+                        ioFailure = true;
+                        break;
                     }
 
                     bytesDone += n;
@@ -642,7 +545,7 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
 
             if (!ok) {
                 // One soft requeue - transient CDN / HTTP2 flakes shouldn't kill the whole job.
-                if (item.requeues < 1 && !failed.load()) {
+                if (!ioFailure && item.requeues < 1 && !failed.load()) {
                     item.requeues = static_cast<uint8_t>(item.requeues + 1);
                     std::lock_guard lock(qmu);
                     queue.push_back(std::move(item));
@@ -662,13 +565,6 @@ depotkit_result runDownload(const depotkit_request *req, depotkit_progress_fn on
         threads.emplace_back(workerFn, i);
     for (auto &t : threads)
         t.join();
-
-    {
-        std::lock_guard lock(filesMu);
-        for (auto &kv : fileSlots)
-            closeFileSlot(*kv.second);
-        fileSlots.clear();
-    }
 
     if (ctrl && ctrl->cancelled.load()) {
         emit(onProgress, user,

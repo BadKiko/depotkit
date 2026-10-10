@@ -59,6 +59,7 @@ set(DEPOTKIT_SOURCES
   src/http/http.cpp
   src/steam/session.cpp
   src/engine/engine.cpp
+  src/engine/file_slot.cpp
   third_party/lzma/LzmaDec.c
 )
 
@@ -100,6 +101,10 @@ if(DEPOTKIT_BUILD_TESTS)
   add_executable(depotkit_test_manifest tests/test_manifest.cpp)
   target_link_libraries(depotkit_test_manifest PRIVATE depotkit)
   add_test(NAME manifest_roundtrip COMMAND depotkit_test_manifest)
+
+  add_executable(depotkit_test_file_slot tests/test_file_slot.cpp)
+  target_link_libraries(depotkit_test_file_slot PRIVATE depotkit)
+  add_test(NAME file_handles_bounded COMMAND depotkit_test_file_slot)
 endif()
 
 install(TARGETS depotkit depotkit-cli
